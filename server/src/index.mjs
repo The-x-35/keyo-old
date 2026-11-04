@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as br from './bitrefill.mjs';
+import * as mcp from './mcp.mjs';
 import * as swap from './swap.mjs';
 import * as zec from './zec.mjs';
 import { suggest, zcashUri } from './intent.mjs';
@@ -81,20 +82,22 @@ function resultText(chip, product, order) {
   }
   const lines = [`🎁 ₹${chip.inr ?? chip.amount} ${product.base_name || name} gift card for you${chip.occasion ? ` (${chip.occasion})` : ''}!`];
   if (r.code) lines.push(`Code: ${r.code}`);
-  if (r.pin) lines.push(`PIN: ${r.pin}`);
+  if (r.pin) lines.push(`${r.code ? 'PIN' : 'Card'}: ${r.pin}`);
+  if (r.other) lines.push(r.other);
   if (r.link) lines.push(`Redeem: ${r.link}`);
-  if (!r.code && !r.link && r.instructions) lines.push(r.instructions);
+  if (!r.code && !r.pin && !r.link && r.instructions) lines.push(r.instructions.replace(/\\n/g, "\n"));
   return lines.join('\n');
 }
 
-async function bitrefill(chip, { approved = false } = {}) {
+async function bitrefill(chip, { approved = false, sandbox = false } = {}) {
+  if (!sandbox && chip.demo) throw new Error(`${cap(chip.name)} is a demo contact. Use Sandbox, or a real contact`);
   const { product, pkg, phone_number } = await resolve(chip);
   const inr = await priceInr(pkg);
   chip = { ...chip, inr, plan: pkg.plan };
   const spent = store.spentToday();
   if (!approved && (inr > CAP_PER_PURCHASE || spent + inr > CAP_PER_DAY)) {
     const id = `apr_${Date.now().toString(36)}`;
-    store.addApproval(id, { chip, inr, product: product.name });
+    store.addApproval(id, { chip, inr, product: product.name, sandbox });
     return {
       status: 'needs_approval',
       approval_id: id,
@@ -102,39 +105,56 @@ async function bitrefill(chip, { approved = false } = {}) {
       message: `₹${inr} is over your limit (₹${CAP_PER_PURCHASE} a purchase, ₹${CAP_PER_DAY - spent} left today). Approve it in Keyo.`,
     };
   }
-  if (process.env.DRY_RUN === '1') {
-    return { status: 'dry_run', message: `Would buy ${product.id} ${pkg.package_id || pkg.value} for ₹${inr}${phone_number ? ' to ' + maskPhone(phone_number) : ''}`, text: resultText(chip, product, { redemption_info: { code: 'DRY-RUN' } }) };
+  if (sandbox || process.env.DRY_RUN === '1') {
+    // Same product, price and wording as a real purchase; nothing is paid.
+    const invoice_id = `sandbox-${Date.now().toString(36)}`;
+    const fake = () => Math.random().toString(36).slice(2, 6).toUpperCase();
+    const redemption = chip.kind === 'esim'
+      ? { barcode_value: `LPA:1$sandbox.keyo$${fake()}${fake()}` }
+      : { code: `TEST-${fake()}-${fake()}`, pin: String(Math.floor(100000 + Math.random() * 900000)) };
+    store.record({ type: 'bitrefill', ok: true, sandbox: true, kind: chip.kind, product: product.name, inr, invoice_id, to: chip.name });
+    return { status: 'done', sandbox: true, invoice_id, text: resultText(chip, product, { redemption_info: redemption }) };
   }
-  const inv = pkg.esim
-    ? await br.buyEsim({ product_id: product.id, value: pkg.value })
-    : await br.buy({ product_id: product.id, package_id: pkg.package_id, value: pkg.package_id ? undefined : pkg.value, phone_number });
-  const done = await br.waitDelivered(inv, { esim: !!pkg.esim });
+  // Someone else with an email on file gets the card straight from Bitrefill.
+  const gift = chip.kind === 'gift' && chip.email && chip.name && chip.name.toLowerCase() !== 'me'
+    ? { recipient_name: cap(chip.name), recipient_email: chip.email, sender_name: process.env.SENDER_NAME || 'A friend', message: chip.occasion ? `Happy ${chip.occasion}!` : 'For you' }
+    : null;
+  const inv = await mcp.buy({ product_id: product.id, package_value: pkg.value, refill_input: phone_number, gift });
+  const done = await mcp.waitDelivered(inv.invoice_id);
   const entry = store.record({
     type: 'bitrefill',
-    ok: !done.pending,
+    ok: done.delivered,
     kind: chip.kind,
     product: product.name,
     inr,
-    invoice_id: inv.id,
-    order_id: inv.orders?.[0]?.id,
+    usd: done.price,
+    invoice_id: inv.invoice_id,
     to: chip.name,
   });
-  if (done.pending) {
-    return { status: 'pending', invoice_id: inv.id, message: `Paid. Waiting for ${product.name} to deliver (invoice ${inv.id}).` };
+  if (!done.delivered) {
+    return { status: 'pending', invoice_id: inv.invoice_id, message: `Paid. ${product.base_name || product.name} is on its way` };
   }
-  return { status: 'done', invoice_id: inv.id, activity_id: entry.id, text: resultText(chip, product, done.order) };
+  const text = gift
+    ? `🎁 Sent you a ₹${inr} ${product.base_name || product.name} gift card. Check your email ${chip.email.replace(/^(.).*(@.*)$/, '$1•••$2')}!`
+    : resultText(chip, product, { redemption_info: done.redemption });
+  return { status: 'done', invoice_id: inv.invoice_id, activity_id: entry.id, text };
 }
 
-async function act(chip, mode = 'zodl') {
+async function act(chip, mode = 'zodl', sandbox = false) {
   switch (chip.kind) {
     case 'topup':
     case 'gift':
     case 'esim':
-      return bitrefill(chip);
+      return bitrefill(chip, { sandbox });
 
     case 'zec_send': {
       if (!chip.address) throw new Error(`No Zcash address saved for ${chip.name || 'that contact'}.`);
       const memo = chip.memo || 'Sent with Keyo';
+      if (sandbox) {
+        const txid = [...Array(64)].map(() => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+        store.record({ type: 'zec', ok: true, sandbox: true, kind: 'send', amount: chip.amount, to: chip.name, txid });
+        return { status: 'done', sandbox: true, txid, text: `🛡️ Sent you ${chip.amount} ZEC, shielded.` };
+      }
       if (mode === 'server') {
         const tx = await zec.send(chip.address, chip.amount, memo);
         store.record({ type: 'zec', ok: true, kind: 'send', amount: chip.amount, to: chip.name, txid: tx.txid });
@@ -143,15 +163,38 @@ async function act(chip, mode = 'zodl') {
       return { status: 'open', open: zcashUri(chip.address, chip.amount, memo), message: `Confirm ${chip.amount} ZEC in Zodl` };
     }
 
+    case 'price': {
+      const usd = (await swap.prices()).ZEC;
+      const rate = await swap.usdToInr();
+      const inrPerZec = usd * rate;
+      const fmt = (n, d = 0) => n.toLocaleString('en-IN', { maximumFractionDigits: d });
+      if (chip.unit === 'INR') {
+        return { status: 'done', text: `₹${fmt(chip.amount)} = ${(chip.amount / inrPerZec).toFixed(5)} ZEC` };
+      }
+      return { status: 'done', text: `${chip.amount} ZEC = ₹${fmt(chip.amount * inrPerZec)} ($${fmt(chip.amount * usd, 2)})` };
+    }
+
+    case 'answer':
+      return { status: 'done', text: await answer(chip.question) };
+
     case 'zec_request': {
-      const mine = process.env.USER_ZEC_ADDRESS;
-      if (!mine) throw new Error('USER_ZEC_ADDRESS is not set in server/.env');
+      if (chip.inr && !chip.amount) {
+        const inrPerZec = (await swap.prices()).ZEC * (await swap.usdToInr());
+        chip = { ...chip, amount: Number((chip.inr / inrPerZec).toFixed(5)) };
+      }
+      const mine = process.env.USER_ZEC_ADDRESS || (await zec.address().catch(() => ({}))).unified;
+      if (!mine) throw new Error('No Zcash address to receive on');
       const uri = zcashUri(mine, chip.amount, chip.memo || 'Keyo request');
-      return { status: 'done', text: `Pay me ${chip.amount} ZEC (shielded): ${uri}` };
+      const why = chip.split ? `Your share of ₹${chip.split.total} is ₹${chip.inr}. ` : '';
+      return { status: 'done', text: `${why}Pay me ${chip.amount} ZEC (shielded): ${uri}` };
     }
 
     case 'swap': {
-      const q = await swap.quote({ from: chip.from, to: chip.to, amount: chip.amount });
+      const q = await swap.quote({ from: chip.from, to: chip.to, amount: chip.amount, dry: sandbox });
+      if (sandbox) {
+        store.record({ type: 'swap', ok: true, sandbox: true, from: q.from, to: q.to, amountIn: q.amountIn, amountOut: q.amountOut });
+        return { status: 'done', sandbox: true, quote: q, text: `🔁 Swapped ${q.amountIn} ${q.from} → ${q.amountOut} ${q.to} through NEAR Intents.` };
+      }
       store.record({ type: 'swap', ok: true, from: q.from, to: q.to, amountIn: q.amountIn, amountOut: q.amountOut, deposit: q.depositAddress });
       if (q.from === 'ZEC') {
         if (mode === 'server') {
@@ -164,6 +207,25 @@ async function act(chip, mode = 'zodl') {
     }
   }
   throw new Error(`Unknown action ${chip.kind}`);
+}
+
+// Instant answers for questions typed in the chat.
+async function answer(question) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('Answers need GEMINI_API_KEY');
+  const model = process.env.GEMINI_MODEL || 'gemini-flash-lite-latest';
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: `Reply with only the answer, one or two short sentences the user can send as a chat message. No preamble, no follow-up remarks.\n\n${question}` }] }],
+      generationConfig: { temperature: 0.3, maxOutputTokens: 120 },
+    }),
+  });
+  const j = await r.json();
+  const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('').trim();
+  if (!text) throw new Error('No answer right now');
+  return text;
 }
 
 function send(res, code, body) {
@@ -180,7 +242,7 @@ async function readJson(req) {
 const routes = {
   'GET /health': async () => ({ ok: true }),
   'POST /suggest': async (b) => ({ chips: await suggest(String(b.text || '')) }),
-  'POST /act': async (b) => act(b.chip, b.mode),
+  'POST /act': async (b) => act(b.chip, b.mode, !!b.sandbox),
   'GET /approval': async (_, q) => store.approval(q.get('id')) || { status: 'missing' },
   'POST /approve': async (b) => {
     const a = store.approval(b.id);
@@ -190,7 +252,7 @@ const routes = {
       return { status: 'declined' };
     }
     store.settleApproval(b.id, 'approved');
-    const out = await bitrefill(a.chip, { approved: true });
+    const out = await bitrefill(a.chip, { approved: true, sandbox: !!a.sandbox });
     store.settleApproval(b.id, out.status === 'done' ? 'done' : 'approved');
     store.approval(b.id).result = out;
     return out;
@@ -204,15 +266,15 @@ const routes = {
   'GET /balance': async () => {
     const out = {};
     try {
-      out.bitrefill = await br.balance();
+      const b = await mcp.balances();
+      out.bitrefill = { balance: b.USD ?? 0, currency: 'USD', all: b };
     } catch (e) {
       out.bitrefillError = e.message;
     }
-    try {
-      out.zec = await zec.balance();
-    } catch (e) {
-      out.zecError = e.message;
-    }
+    const [main, test] = await Promise.allSettled([zec.balance('main'), zec.balance('test')]);
+    if (main.status === 'fulfilled') out.zec = main.value;
+    else out.zecError = main.reason.message;
+    if (test.status === 'fulfilled') out.zecTest = test.value;
     return out;
   },
   'GET /swap/status': async (_, q) => swap.status(q.get('deposit')),

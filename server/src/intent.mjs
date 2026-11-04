@@ -56,15 +56,34 @@ function rules(text) {
     let who = OPERATORS.includes(m[1]) ? null : findContact(m[1]);
     if (!who && (m[1] === undefined || m[1] === 'my' || OPERATORS.includes(m[1]))) who = findContact('me');
     const operator = m[2] || (OPERATORS.includes(m[1]) ? m[1] : null) || who?.operator || null;
-    chips.push({ kind: 'topup', amount: num(m[3]), name: who?.name || m[1] || 'me', phone: who?.phone || null, operator });
+    chips.push({ kind: 'topup', amount: num(m[3]), name: who?.name || m[1] || 'me', phone: who?.phone || null, operator, demo: !!who?.demo });
   }
 
   // "send mom a ₹500 swiggy gift card", "gift rahul 200 amazon"
   m = t.match(/\b(?:send|gift|buy)\s+(?:(\w+)\s+)?(?:an?\s+)?(?:₹|rs\.?\s?)?(\d[\d,]*)?\s*(?:rs\.?\s*|rupees?\s*)?(swiggy|zomato|amazon|flipkart|blinkit|bigbasket|myntra|uber|bookmyshow|hotstar|makemytrip|apollo|phonepe|jiomart)(?:\s+(?:gift\s*card|voucher|card))?(?:\s+(?:of|for|worth)\s+(?:₹|rs\.?\s?)?(\d[\d,]*))?(?:\s+(?:to|for)\s+(\w+))?/);
   if (m && !chips.some((c) => c.kind === 'zec_send')) {
     const who = findContact(m[5] || m[1]);
-    chips.push({ kind: 'gift', brand: m[3], amount: num(m[2] || m[4] || 100), name: who?.name || m[5] || (m[1] && m[1] !== 'a' ? m[1] : null) });
+    chips.push({ kind: 'gift', brand: m[3], amount: num(m[2] || m[4] || 100), name: who?.name || m[5] || (m[1] && m[1] !== 'a' ? m[1] : null), email: who?.email || null, demo: !!who?.demo });
   }
+
+  // "esim for dubai", "get mom an esim in london"
+  m = t.match(/\besim\s+(?:for|in|to)\s+([a-z]+(?:\s[a-z]+)?)/);
+  if (m) chips.push({ kind: 'esim', country: m[1].replace(/\b(tomorrow|today|tonight|please|pls)\b.*$/, '').trim() });
+
+  // "split 1200 between 4", "dinner was ₹1200 split with 3 people"
+  m = t.match(/(?:₹|rs\.?\s?)?(\d[\d,]*)\D{0,30}?\bsplit\b\D{0,20}?(\d+)|\bsplit\s+(?:₹|rs\.?\s?)?(\d[\d,]*)\s+(?:between|with|among|by|in)\s+(\d+)/);
+  if (m) {
+    const total = num(m[1] || m[3]);
+    const people = Number(m[2] || m[4]);
+    if (total && people > 1) chips.push({ kind: 'zec_request', inr: Math.round(total / people), split: { total, people } });
+  }
+
+  // "zec price", "₹500 in zec", "0.1 zec in rupees"
+  if (/\b(zec|zcash)\s+(price|rate)\b|\bprice of (zec|zcash)\b|how much is (a |one |1 )?(zec|zcash)/.test(t)) chips.push({ kind: 'price', amount: 1, unit: 'ZEC' });
+  m = t.match(/(?:₹|rs\.?\s?)(\d[\d,]*)\s+(?:in|to)\s+zec\b|\b(\d[\d,]*)\s*(?:rupees|inr)\s+(?:in|to)\s+zec\b/);
+  if (m) chips.push({ kind: 'price', amount: num(m[1] || m[2]), unit: 'INR' });
+  m = t.match(/\b([\d.]+)\s*zec\s+(?:in|to)\s+(rupees|inr|usd|dollars)\b/);
+  if (m) chips.push({ kind: 'price', amount: num(m[1]), unit: 'ZEC' });
 
   // Occasion words suggest a gift card nobody asked for yet.
   if (!chips.length) {
@@ -88,6 +107,8 @@ function rules(text) {
     const me = findContact('me');
     chips.push({ kind: 'topup', amount: 199, name: 'me', phone: me?.phone || null, operator: me?.operator || 'jio' });
   }
+  // A plain question gets an instant answer chip.
+  if (!chips.length && /\?\s*$/.test(t) && t.split(/\s+/).length >= 4) chips.push({ kind: 'answer', question: text.trim() });
   return chips;
 }
 
@@ -140,7 +161,12 @@ function label(c) {
     case 'zec_send':
       return { title: `Send ${c.amount} ZEC${c.name ? ' to ' + cap(c.name) : ''}`, subtitle: c.address ? 'Shielded · Zcash' : 'No address saved' };
     case 'zec_request':
+      if (c.split) return { title: `Split ₹${c.split.total} by ${c.split.people}: ask ₹${c.inr}`, subtitle: 'Paid in shielded ZEC' };
       return { title: `Request ${c.amount} ZEC`, subtitle: 'Shielded link' };
+    case 'price':
+      return { title: c.unit === 'INR' ? `₹${c.amount} in ZEC` : `${c.amount} ZEC in ₹ and $`, subtitle: 'Live price' };
+    case 'answer':
+      return { title: 'Ask Keyo', subtitle: c.question.slice(0, 32) };
     case 'swap':
       return { title: `Swap ${c.amount} ${c.from} → ${c.to}`, subtitle: 'NEAR Intents' };
     case 'topup':

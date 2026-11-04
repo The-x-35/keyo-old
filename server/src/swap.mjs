@@ -36,18 +36,22 @@ export async function usdToInr() {
 }
 
 // Where swapped funds go and where refunds return, per chain. Set in server/.env.
+// Dry quotes move nothing, so any valid address works as a stand-in there.
+const STAND_IN = { sol: 'So11111111111111111111111111111111111111112', eth: '0x000000000000000000000000000000000000dEaD' };
+let dryRun = false;
 function addressFor(chain) {
   const env = { zec: 'USER_ZEC_ADDRESS', sol: 'USER_SOL_ADDRESS', eth: 'USER_ETH_ADDRESS' }[chain];
-  const v = process.env[env];
+  const v = process.env[env] || (chain === 'zec' ? process.env.AEGIS_UA : null) || (dryRun ? STAND_IN[chain] : null);
   if (!v) throw new Error(`${env} is not set in server/.env`);
   return v;
 }
 // 1Click refunds ZEC to a transparent address only.
 function refundFor(chain) {
-  return chain === 'zec' ? process.env.USER_ZEC_REFUND_ADDRESS || addressFor('zec') : addressFor(chain);
+  return chain === 'zec' ? process.env.USER_ZEC_REFUND_ADDRESS || process.env.AEGIS_TADDR || addressFor('zec') : addressFor(chain);
 }
 
 export async function quote({ from, to, amount, dry = false }) {
+  dryRun = dry;
   const a = ASSETS[from.toUpperCase()];
   const b = ASSETS[to.toUpperCase()];
   if (!a || !b) throw new Error(`Can't swap ${from} to ${to}`);

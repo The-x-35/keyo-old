@@ -38,7 +38,7 @@ export function record(entry) {
 export function spentToday() {
   const day = new Date(Date.now() + 5.5 * 3600_000).toISOString().slice(0, 10);
   return state.activity
-    .filter((a) => a.type === 'bitrefill' && a.ok && new Date(Date.parse(a.at) + 5.5 * 3600_000).toISOString().slice(0, 10) === day)
+    .filter((a) => a.type === 'bitrefill' && a.ok && !a.sandbox && new Date(Date.parse(a.at) + 5.5 * 3600_000).toISOString().slice(0, 10) === day)
     .reduce((s, a) => s + (Number(a.inr) || 0), 0);
 }
 
